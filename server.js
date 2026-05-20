@@ -9,7 +9,8 @@ import fs from "fs";
 import crypto from "crypto";
 import googleTTS from "google-tts-api";
 import { fileURLToPath } from "url";
-import ffmpeg from "fluent-ffmpeg";
+// import ffmpeg from "fluent-ffmpeg";
+// import Ffmpeg from "fluent-ffmpeg";
 // Import local modules
 import routerIO from "./router/io.js";
 import message from "./router/message.js";
@@ -17,8 +18,22 @@ import { RegAnalyze } from "./ulti/reg_analyze.js";
 import { RegAnalyzeInPrac } from "./ulti/reg_analyze_inprac.js";
 import { GetDataPracInCustom } from "./ulti/get_data_prac_in_custom.js";
 import { sendmailDK } from "./ulti/get_homework_and_email.js";
-
+import ttsList from "./router/ttsListtoMp3only.js";
+import ttsListTV from "./router/ttsListtoMp3_TV.js";
 // Environment variables
+import mp3Cut from "./router/ttsListtoCutSilence.js";
+// Thêm vào đầu server.js sau các import
+import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import ffprobeInstaller from "@ffprobe-installer/ffprobe";
+import Ffmpeg from "fluent-ffmpeg";
+
+// Cấu hình ffmpeg path
+Ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+Ffmpeg.setFfprobePath(ffprobeInstaller.path);
+
+console.log("FFmpeg path:", ffmpegInstaller.path);
+console.log("FFprobe path:", ffprobeInstaller.path);
+
 const port = process.env.PORT || 5000;
 
 // Express app initialization
@@ -58,6 +73,10 @@ app.get("/test", (req, res) => {
   res.json({ message: "Success from GET /test" });
 });
 
+app.post("/testpost", (req, res) => {
+  console.log("GET test success", req.query);
+  res.json({ message: "Success from GET /test" });
+});
 /**
  * Route handler for analyzing transcript text against command lists
  * Expects JSON body with transcript, CMDlist, and numberTry fields
@@ -405,6 +424,23 @@ app.post("/tts", (req, res) => {
   processQueue();
 });
 
+app.get("/test-ffmpeg", async (req, res) => {
+  try {
+    Ffmpeg.getAvailableFormats((err, formats) => {
+      if (err) {
+        res.json({ success: false, error: err.message });
+      } else {
+        res.json({
+          success: true,
+          ffmpegPath: ffmpegInstaller.path,
+          formatCount: Object.keys(formats).length,
+        });
+      }
+    });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
 // Create the server
 const server = http.createServer(app);
 
@@ -419,6 +455,9 @@ const io = new SocketIOServer(server, {
 // Pass the io instance to the router modules
 routerIO(io);
 message(io);
+app.use("/", ttsList(jsonParser, Ffmpeg)); // ✅ ĐÚNG
+app.use("/", ttsListTV(jsonParser)); // ✅ ĐÚNG
+app.use("/", mp3Cut(jsonParser, Ffmpeg)); // ✅ ĐÚNG
 
 // Start the server
 server.listen(port, () => {

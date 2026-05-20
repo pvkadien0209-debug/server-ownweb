@@ -1,0 +1,30 @@
+[
+  {
+    "stt": 1,
+    "code": "Ngochoang_001",
+    "text": "Đây là",
+    "sheet": 2,
+    "row": 2
+  },
+  {
+    "stt": 2,
+    "code": "Ngochoang_002",
+    "text": "chùa Ngọc hoàng",
+    "sheet": 2,
+    "row": 3
+  },
+  {
+    "stt": 3,
+    "code": "Ngochoang_003",
+    "text": "Một Danh Lam",
+    "sheet": 2,
+    "row": 4
+  },
+  {
+    "stt": 4,
+    "code": "Ngochoang_004",
+    "text": "Tại Thành phố Hồ Chí minh",
+    "sheet": 2,
+    "row": 5
+  }
+]
