@@ -5,23 +5,22 @@ const path = require("path");
 const googleTTS = require("google-tts-api");
 const ffmpeg = require("fluent-ffmpeg");
 
-// ── Defaults theo từng ngôn ngữ (chỉ dùng khi KHÔNG có giá trị nào được truyền vào) ──
+// ── Defaults (overridable per request) ───────────────────────────────────────
 const DEFAULTS_vi = {
   speedRate: 1.1, // atempo: 0.5 – 2.0
-  pitchShift: 1.4, // pitch multiplier: 0.5 – 2.0  (>1 = cao hơn, <1 = thấp hơn)
-  volume: 1.0, // linear gain: 0.1 – 5.0
+  pitchShift: 1.4, // pitch multiplier: 0.5 – 2.0  (>1 = higher, <1 = lower)
+  volume: 2.0, // linear gain: 0.1 – 5.0
   slow: false, // Google TTS slow reading
-  lang: "vi",
+  lang: "vi", // "vi" | "en"
 };
 
 const DEFAULTS_en = {
-  speedRate: 0.8,
-  pitchShift: 1.4,
-  volume: 2.0,
-  slow: true,
-  lang: "en",
+  speedRate: 0.8, // atempo: 0.5 – 2.0
+  pitchShift: 1, // pitch multiplier: 0.5 – 2.0  (>1 = higher, <1 = lower)
+  volume: 1.0, // linear gain: 0.1 – 5.0
+  slow: true, // Google TTS slow reading
+  lang: "vi", // "vi" | "en"
 };
-
 const TTS_DIR = path.resolve(__dirname, "./ttsListTV");
 const TEMP_DIR = path.resolve(__dirname, "./temp_tts");
 if (!fs.existsSync(TTS_DIR)) fs.mkdirSync(TTS_DIR, { recursive: true });
@@ -29,45 +28,23 @@ if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-// Không có lang truyền vào (hoặc null/rỗng) → mặc định "vi"
 function detectLang(raw, fallback = "vi") {
-  const lang = String(raw ?? "")
-    .trim()
-    .toLowerCase();
-  if (!lang) return fallback;
-  return lang === "vi" ? "vi" : "en";
-}
-
-function getDefaultsByLang(lang) {
-  return lang === "en" ? DEFAULTS_en : DEFAULTS_vi;
+  if (!raw) return fallback;
+  return /^en$/i.test(String(raw).trim()) ? "en" : "vi";
 }
 
 function clamp(val, min, max) {
-  if (val === undefined || val === null || val === "") return null;
   const n = parseFloat(val);
   return isNaN(n) ? null : Math.min(max, Math.max(min, n));
 }
 
-/**
- * Gộp tham số CHỈ theo 2 mức ưu tiên:
- *   1) item (object riêng của từng dòng: {code, lang, speedRate, volume, pitchShift, slow}) → cao nhất
- *   2) DEFAULTS_vi / DEFAULTS_en (tuỳ theo lang cuối cùng được xác định) → fallback cuối
- * Nếu item không có lang hoặc lang = null/rỗng → mặc định "vi".
- */
-function mergeParams(item = {}) {
-  const lang = detectLang(item.lang, "vi");
-  const def = getDefaultsByLang(lang);
-  const pickNumber = (key, min, max) => {
-    const fromItem = clamp(item[key], min, max);
-    return fromItem !== null ? fromItem : def[key];
-  };
-  const slow = typeof item.slow === "boolean" ? item.slow : def.slow;
+function resolveParams(body) {
   return {
-    lang,
-    speedRate: pickNumber("speedRate", 0.5, 2.0),
-    pitchShift: pickNumber("pitchShift", 0.5, 2.0),
-    volume: pickNumber("volume", 0.1, 5.0),
-    slow,
+    speedRate: clamp(body.speedRate, 0.5, 2.0) ?? DEFAULTS.speedRate,
+    pitchShift: clamp(body.pitchShift, 0.5, 2.0) ?? DEFAULTS.pitchShift,
+    volume: clamp(body.volume, 0.1, 5.0) ?? DEFAULTS.volume,
+    slow: typeof body.slow === "boolean" ? body.slow : DEFAULTS.slow,
+    lang: detectLang(body.lang, DEFAULTS.lang),
   };
 }
 
@@ -149,7 +126,6 @@ function buildTempoFilters(speed) {
   return out;
 }
 
-// volume được điều chỉnh bằng ffmpeg (audioFilters "volume=...")
 async function applyAudioFilters(
   inputBuffer,
   outputPath,
@@ -167,6 +143,7 @@ async function applyAudioFilters(
       ];
       if (volume > 2) filters.push("alimiter=limit=0.95:attack=5:release=50");
       console.log(`  → Filters: ${filters.join(", ")}`);
+
       ffmpeg(tempIn)
         .audioFilters(filters)
         .format("mp3")
@@ -195,48 +172,54 @@ function tryUnlink(p) {
   } catch (_) {}
 }
 
-/**
- * item: { code, text, lang?, speedRate?, pitchShift?, volume?, slow? }
- * Chỉ 2 mức ưu tiên: item → DEFAULTS_vi/DEFAULTS_en (theo lang, mặc định "vi" nếu thiếu/null)
- */
-async function processTextToMp3(item) {
+async function processTextToMp3(item, params) {
   const filePath = path.join(TTS_DIR, `${item.code}.mp3`);
-  const params = mergeParams(item);
+  // item-level lang overrides global params.lang
+  const lang = detectLang(item.lang, params.lang);
   console.log(
-    `🎵 [${item.code}] lang=${params.lang} speed=${params.speedRate} pitch=${params.pitchShift} vol=${params.volume} slow=${params.slow}`,
+    `🎵 [${item.code}] lang=${lang} speed=${params.speedRate} pitch=${params.pitchShift} vol=${params.volume} slow=${params.slow}`,
   );
-  const raw = await buildRawBuffer(item.text, params.lang, params.slow);
+
+  const raw = await buildRawBuffer(item.text, lang, params.slow);
   await applyAudioFilters(raw, filePath, params);
+
   const size = fs.statSync(filePath).size;
   console.log(`  ✅ ${item.code}.mp3 (${(size / 1024).toFixed(1)} KB)`);
-  return { filePath, params };
+  return filePath;
 }
 
 // ── Routes ───────────────────────────────────────────────────────────────────
+
 module.exports = (jsonParser) => {
   /**
    * POST /ttslistTV/generate
    * Body: {
-   *   code       : string   (required)
-   *   text       : string   (required)
-   *   lang?      : "vi"|"en"      – ưu tiên cao nhất (per-item); không có/null → "vi"
-   *   speedRate? : 0.5 – 2.0
-   *   pitchShift?: 0.5 – 2.0
-   *   volume?    : 0.1 – 5.0
-   *   slow?      : boolean
+   *   code      : string   (required)
+   *   text      : string   (required)
+   *   lang?     : "vi"|"en"           – per-item, overrides global param
+   *   speedRate?  : 0.5 – 2.0         – playback speed
+   *   pitchShift? : 0.5 – 2.0         – pitch multiplier
+   *   volume?     : 0.1 – 5.0         – linear gain
+   *   slow?       : boolean            – Google TTS slow mode
    * }
-   * Nếu không truyền speedRate/pitchShift/volume/slow → dùng DEFAULTS_vi hoặc DEFAULTS_en
-   * tuỳ theo lang được chọn.
+   * Response: mp3 binary → auto-download on client
    */
   router.post("/ttslistTV/generate", jsonParser, async (req, res) => {
-    const { text, code, lang, speedRate, pitchShift, volume, slow } = req.body;
+    const { text, code, lang: itemLang } = req.body;
     if (!text || !code)
       return res
         .status(400)
         .json({ success: false, message: "Missing: text, code" });
-    const item = { text, code, lang, speedRate, pitchShift, volume, slow };
+
+    const params = resolveParams(req.body);
+    // item-level lang takes final priority
+    if (itemLang) params.lang = detectLang(itemLang, params.lang);
+
     try {
-      const { filePath, params } = await processTextToMp3(item);
+      const filePath = await processTextToMp3(
+        { text, code, lang: itemLang },
+        params,
+      );
       res.set({
         "Content-Type": "audio/mpeg",
         "Content-Disposition": `attachment; filename="${code}.mp3"`,
@@ -255,7 +238,7 @@ module.exports = (jsonParser) => {
     }
   });
 
-  // ── Batch (legacy – đọc ttsListTV.json) ───────────────────────────────────
+  // ── Batch (legacy – reads ttsListTV.json) ─────────────────────────────────
   const textList = (() => {
     try {
       return require("./ttsListTV.json");
@@ -264,14 +247,9 @@ module.exports = (jsonParser) => {
     }
   })();
 
-  /**
-   * POST /ttslistTV
-   * Mỗi phần tử trong ttsListTV.json tự khai báo (nếu muốn override):
-   *   { code, text, lang?, speedRate?, pitchShift?, volume?, slow? }
-   * Chỉ 2 mức ưu tiên: item > DEFAULTS_vi/DEFAULTS_en (theo lang, mặc định "vi" nếu thiếu/null).
-   */
   router.post("/ttslistTV", jsonParser, async (req, res) => {
-    console.log(`🎵 Batch: ${textList.length} items`);
+    const params = resolveParams(req.body);
+    console.log(`🎵 Batch: ${textList.length} items | params:`, params);
     const results = [];
     const t0 = Date.now();
     for (let i = 0; i < textList.length; i++) {
@@ -285,12 +263,11 @@ module.exports = (jsonParser) => {
         continue;
       }
       try {
-        const { filePath, params } = await processTextToMp3(item);
+        const fp = await processTextToMp3(item, params);
         results.push({
           success: true,
           code: item.code,
-          size: fs.statSync(filePath).size,
-          params,
+          size: fs.statSync(fp).size,
         });
       } catch (e) {
         results.push({ success: false, code: item.code, error: e.message });
@@ -300,7 +277,7 @@ module.exports = (jsonParser) => {
     const ok = results.filter((r) => r.success);
     res.json({
       success: true,
-      defaults: { vi: DEFAULTS_vi, en: DEFAULTS_en },
+      params,
       stats: {
         total: textList.length,
         successful: ok.length,
@@ -314,12 +291,11 @@ module.exports = (jsonParser) => {
   router.get("/ttslistTV", (_, res) =>
     res.json({
       success: true,
-      defaults: { vi: DEFAULTS_vi, en: DEFAULTS_en },
+      defaults: DEFAULTS,
       count: textList.length,
       items: textList,
     }),
   );
-
   router.get("/ttslistTV/files", (_, res) => {
     try {
       const files = fs
@@ -340,7 +316,6 @@ module.exports = (jsonParser) => {
       res.status(500).json({ success: false, error: e.message });
     }
   });
-
   router.get("/ttslistTV/play/:code", (req, res) => {
     const fp = path.join(TTS_DIR, `${req.params.code}.mp3`);
     if (!fs.existsSync(fp)) return res.status(404).json({ success: false });
@@ -350,7 +325,6 @@ module.exports = (jsonParser) => {
     });
     fs.createReadStream(fp).pipe(res);
   });
-
   router.delete("/ttslistTV/:code", (req, res) => {
     const fp = path.join(TTS_DIR, `${req.params.code}.mp3`);
     if (!fs.existsSync(fp)) return res.status(404).json({ success: false });
