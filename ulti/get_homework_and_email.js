@@ -3,24 +3,25 @@ const nodemailer = require("nodemailer");
 async function sendmailDK(
   subjectText,
   contentText,
-  toEmail = "dienpham187294@gmail.com"
+  toEmail = "pvkadien0209@gmail.com"
 ) {
   try {
     const transporter = nodemailer.createTransport({
       service: "gmail",
       auth: {
-        user: "dienpham187294@gmail.com",
-        pass: "rqccbitaohabcrzv", // Nên lưu vào biến môi trường để bảo mật
+        user: "pvkadien0209@gmail.com",
+        pass: "hwkflmwdaivrfajx", // Nên lưu vào biến môi trường để bảo mật
       },
     });
 
     const mailOptions = {
-      from: '"Cùng-thực-hành" <dienpham187294@gmail.com>',
+      from: '"PVD English" <pvkadien0209@gmail.com>',
       to: toEmail,
       subject: subjectText,
       html: `
         <div style="width:500px; text-align:center; border: 1px solid green; border-radius:5px; padding: 10px;">
-          <h3>Cùng thực hành tiếng Anh</h3>
+          <h3>Học kiến thức - Rèn kĩ năng</h3>
+          <h2>BUILD CONFIDENCE - OPEN YOUR FUTURE.</h2>
           <hr/>
           <h5>${contentText}</h5>
           <h1>Bạn đã nộp bài thành công!</h1>
