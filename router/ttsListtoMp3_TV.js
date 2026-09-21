@@ -5,20 +5,28 @@ const path = require("path");
 const googleTTS = require("google-tts-api");
 const ffmpeg = require("fluent-ffmpeg");
 
-// ── Defaults theo từng ngôn ngữ (chỉ dùng khi KHÔNG có giá trị nào được truyền vào) ──
+// ── DEFAULTS_vi / DEFAULTS_en = BỘ THAM SỐ CHUẨN (baseline) theo từng ngôn ngữ ──
+// Quy ước: speedRate = 1.0, pitchShift = 1.0, volume = 1.0 LUÔN là mức "CHUẨN"
+// (= giữ nguyên, không chỉnh gì cả — atempo=1, asetrate tỉ lệ 1:1, gain x1).
+// Muốn nhanh/chậm, cao/thấp giọng, to/nhỏ hơn thì chỉnh TỪ mốc 1.0 lên hoặc xuống
+// (ví dụ 1.1 = nhanh hơn 10%, 0.9 = chậm hơn 10%), KHÔNG đặt sẵn lệch khỏi 1.0
+// trong DEFAULTS để tránh tự động làm méo/biến đổi giọng khi không ai yêu cầu.
+// Đây là giá trị áp dụng cho bất kỳ tham số nào KHÔNG được truyền (hoặc truyền
+// sai/không hợp lệ) trong item. Nếu item có truyền giá trị hợp lệ, giá trị đó
+// vẫn được ưu tiên dùng (xem mergeParams).
 const DEFAULTS_vi = {
-  speedRate: 1.1, // atempo: 0.5 – 2.0
-  pitchShift: 1.4, // pitch multiplier: 0.5 – 2.0  (>1 = cao hơn, <1 = thấp hơn)
-  volume: 1.0, // linear gain: 0.1 – 5.0
+  speedRate: 1.0, // atempo: 0.5 – 2.0   (1.0 = chuẩn, không đổi tốc độ)
+  pitchShift: 1.0, // pitch multiplier: 0.5 – 2.0  (1.0 = chuẩn, không đổi cao độ)
+  volume: 1.0, // linear gain: 0.1 – 5.0   (1.0 = chuẩn, không đổi âm lượng)
   slow: false, // Google TTS slow reading
   lang: "vi",
 };
 
 const DEFAULTS_en = {
-  speedRate: 0.8,
-  pitchShift: 1.4,
-  volume: 2.0,
-  slow: true,
+  speedRate: 1.0, // 1.0 = chuẩn, không đổi tốc độ
+  pitchShift: 1.0, // 1.0 = chuẩn, không đổi cao độ
+  volume: 1.0, // 1.0 = chuẩn, không đổi âm lượng
+  slow: true, // Google TTS slow reading
   lang: "en",
 };
 
@@ -29,7 +37,7 @@ if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-// Không có lang truyền vào (hoặc null/rỗng) → mặc định "vi"
+// Không có lang truyền vào (hoặc null/rỗng) → mặc định (chuẩn) "vi"
 function detectLang(raw, fallback = "vi") {
   const lang = String(raw ?? "")
     .trim()
@@ -49,19 +57,21 @@ function clamp(val, min, max) {
 }
 
 /**
- * Gộp tham số CHỈ theo 2 mức ưu tiên:
- *   1) item (object riêng của từng dòng: {code, lang, speedRate, volume, pitchShift, slow}) → cao nhất
- *   2) DEFAULTS_vi / DEFAULTS_en (tuỳ theo lang cuối cùng được xác định) → fallback cuối
- * Nếu item không có lang hoặc lang = null/rỗng → mặc định "vi".
+ * Gộp tham số theo đúng 2 mức ưu tiên, với DEFAULTS_vi / DEFAULTS_en làm CHUẨN:
+ *   1) item (object riêng của từng dòng: {code, lang, speedRate, volume, pitchShift, slow})
+ *      → override khi có giá trị hợp lệ.
+ *   2) DEFAULTS_vi / DEFAULTS_en (tuỳ theo lang cuối cùng được xác định) → CHUẨN / baseline,
+ *      luôn được dùng khi item không truyền giá trị hợp lệ cho tham số đó.
+ * Nếu item không có lang hoặc lang = null/rỗng → mặc định (chuẩn) "vi".
  */
 function mergeParams(item = {}) {
   const lang = detectLang(item.lang, "vi");
-  const def = getDefaultsByLang(lang);
+  const STANDARD = getDefaultsByLang(lang); // bộ tham số chuẩn áp dụng cho lang này
   const pickNumber = (key, min, max) => {
-    const fromItem = clamp(item[key], min, max);
-    return fromItem !== null ? fromItem : def[key];
+    const override = clamp(item[key], min, max);
+    return override !== null ? override : STANDARD[key];
   };
-  const slow = typeof item.slow === "boolean" ? item.slow : def.slow;
+  const slow = typeof item.slow === "boolean" ? item.slow : STANDARD.slow;
   return {
     lang,
     speedRate: pickNumber("speedRate", 0.5, 2.0),
@@ -149,44 +159,81 @@ function buildTempoFilters(speed) {
   return out;
 }
 
-// volume được điều chỉnh bằng ffmpeg (audioFilters "volume=...")
+// Coi là "1.0 / chuẩn" nếu rất gần 1 (tránh lỗi số thực kiểu 0.999999999)
+function isUnity(n) {
+  return Math.abs(n - 1) < 1e-6;
+}
+
+// Dò sample rate THẬT của file audio gốc (Google TTS) bằng ffprobe, thay vì
+// đoán cứng 44100 — đoán sai base rate là nguyên nhân chính khiến asetrate
+// làm méo/lệch tốc độ-cao độ ngay cả khi pitchShift=1.0. Fallback 24000Hz nếu
+// không dò được (mức Google Translate TTS thường trả về).
+function getNativeSampleRate(filePath) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(filePath, (err, data) => {
+      if (err) return resolve(24000);
+      const audioStream = (data.streams || []).find(
+        (s) => s.codec_type === "audio",
+      );
+      const rate = audioStream && parseInt(audioStream.sample_rate, 10);
+      resolve(Number.isFinite(rate) && rate > 0 ? rate : 24000);
+    });
+  });
+}
+
+/**
+ * Áp filter tốc độ/cao độ/âm lượng.
+ * QUAN TRỌNG: nếu speedRate, pitchShift, volume đều = 1.0 (mức CHUẨN) →
+ * KHÔNG chạy qua ffmpeg/re-encode gì cả, copy thẳng file gốc từ Google để
+ * đảm bảo âm thanh giống 100% bản gốc, không bị méo do xử lý thừa.
+ * Chỉ khi có tham số lệch khỏi 1.0 mới thực sự chạy filter tương ứng, và khi
+ * đó dùng sample rate THẬT của file (ffprobe) làm gốc cho asetrate để tránh
+ * lệch tốc độ/cao độ ngoài ý muốn.
+ */
 async function applyAudioFilters(
   inputBuffer,
   outputPath,
   { speedRate, pitchShift, volume },
 ) {
-  return new Promise((resolve, reject) => {
-    const tempIn = path.join(TEMP_DIR, `tmp_${Date.now()}.mp3`);
-    try {
-      fs.writeFileSync(tempIn, inputBuffer);
-      const filters = [
-        `asetrate=44100*${(1 / pitchShift).toFixed(6)}`,
-        "aresample=44100",
-        ...buildTempoFilters(speedRate),
-        `volume=${volume}`,
-      ];
-      if (volume > 2) filters.push("alimiter=limit=0.95:attack=5:release=50");
-      console.log(`  → Filters: ${filters.join(", ")}`);
+  const tempIn = path.join(TEMP_DIR, `tmp_${Date.now()}.mp3`);
+  try {
+    fs.writeFileSync(tempIn, inputBuffer);
+
+    if (isUnity(speedRate) && isUnity(pitchShift) && isUnity(volume)) {
+      console.log(
+        "  → Chuẩn 1.0/1.0/1.0: giữ nguyên audio gốc, không qua ffmpeg",
+      );
+      fs.copyFileSync(tempIn, outputPath);
+      return;
+    }
+
+    const nativeRate = await getNativeSampleRate(tempIn);
+    const filters = [];
+    if (!isUnity(pitchShift)) {
+      filters.push(`asetrate=${nativeRate}*${(1 / pitchShift).toFixed(6)}`);
+      filters.push(`aresample=${nativeRate}`);
+    }
+    if (!isUnity(speedRate)) filters.push(...buildTempoFilters(speedRate));
+    if (!isUnity(volume)) filters.push(`volume=${volume}`);
+    if (volume > 2) filters.push("alimiter=limit=0.95:attack=5:release=50");
+    console.log(
+      `  → Filters (native=${nativeRate}Hz): ${filters.join(", ") || "(none)"}`,
+    );
+
+    await new Promise((resolve, reject) => {
       ffmpeg(tempIn)
         .audioFilters(filters)
         .format("mp3")
         .audioCodec("libmp3lame")
         .audioBitrate("128k")
         .output(outputPath)
-        .on("end", () => {
-          tryUnlink(tempIn);
-          resolve();
-        })
-        .on("error", (e) => {
-          tryUnlink(tempIn);
-          reject(e);
-        })
+        .on("end", resolve)
+        .on("error", reject)
         .run();
-    } catch (e) {
-      tryUnlink(tempIn);
-      reject(e);
-    }
-  });
+    });
+  } finally {
+    tryUnlink(tempIn);
+  }
 }
 
 function tryUnlink(p) {
@@ -197,7 +244,8 @@ function tryUnlink(p) {
 
 /**
  * item: { code, text, lang?, speedRate?, pitchShift?, volume?, slow? }
- * Chỉ 2 mức ưu tiên: item → DEFAULTS_vi/DEFAULTS_en (theo lang, mặc định "vi" nếu thiếu/null)
+ * Chỉ 2 mức ưu tiên: item (override) → DEFAULTS_vi/DEFAULTS_en (CHUẨN, theo lang,
+ * mặc định "vi" nếu thiếu/null).
  */
 async function processTextToMp3(item) {
   const filePath = path.join(TTS_DIR, `${item.code}.mp3`);
@@ -220,13 +268,13 @@ module.exports = (jsonParser) => {
    *   code       : string   (required)
    *   text       : string   (required)
    *   lang?      : "vi"|"en"      – ưu tiên cao nhất (per-item); không có/null → "vi"
-   *   speedRate? : 0.5 – 2.0
-   *   pitchShift?: 0.5 – 2.0
-   *   volume?    : 0.1 – 5.0
-   *   slow?      : boolean
+   *   speedRate? : 0.5 – 2.0       (không truyền / truyền sai → dùng giá trị CHUẨN)
+   *   pitchShift?: 0.5 – 2.0       (không truyền / truyền sai → dùng giá trị CHUẨN)
+   *   volume?    : 0.1 – 5.0       (không truyền / truyền sai → dùng giá trị CHUẨN)
+   *   slow?      : boolean         (không truyền → dùng giá trị CHUẨN)
    * }
    * Nếu không truyền speedRate/pitchShift/volume/slow → dùng DEFAULTS_vi hoặc DEFAULTS_en
-   * tuỳ theo lang được chọn.
+   * (bộ tham số CHUẨN) tuỳ theo lang được chọn.
    */
   router.post("/ttslistTV/generate", jsonParser, async (req, res) => {
     const { text, code, lang, speedRate, pitchShift, volume, slow } = req.body;
@@ -268,7 +316,8 @@ module.exports = (jsonParser) => {
    * POST /ttslistTV
    * Mỗi phần tử trong ttsListTV.json tự khai báo (nếu muốn override):
    *   { code, text, lang?, speedRate?, pitchShift?, volume?, slow? }
-   * Chỉ 2 mức ưu tiên: item > DEFAULTS_vi/DEFAULTS_en (theo lang, mặc định "vi" nếu thiếu/null).
+   * Chỉ 2 mức ưu tiên: item (override) > DEFAULTS_vi/DEFAULTS_en (CHUẨN, theo lang,
+   * mặc định "vi" nếu thiếu/null).
    */
   router.post("/ttslistTV", jsonParser, async (req, res) => {
     console.log(`🎵 Batch: ${textList.length} items`);

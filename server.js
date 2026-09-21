@@ -18,6 +18,7 @@ import { RegAnalyze } from "./ulti/reg_analyze.js";
 import { RegAnalyzeInPrac } from "./ulti/reg_analyze_inprac.js";
 import { GetDataPracInCustom } from "./ulti/get_data_prac_in_custom.js";
 import { sendmailDK } from "./ulti/get_homework_and_email.js";
+import { connectMongo, closeMongo, getCollection } from "./ulti/mongodb.js";
 import ttsList from "./router/ttsListtoMp3only.js";
 import ttsListTV from "./router/ttsListtoMp3_TV.js";
 // Environment variables
@@ -57,11 +58,6 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Routes
-app.get("/", (req, res) => {
-  res.send("Welcome to the server!");
-});
 
 app.get("/message", (req, res) => {
   res.send("Hello from the backend!");
@@ -162,7 +158,7 @@ app.post(
         filerSets,
         upCode,
         random,
-        fsp
+        fsp,
       );
       // Return successful response
       return res.status(200).json({
@@ -179,7 +175,7 @@ app.post(
         error: error.message,
       });
     }
-  }
+  },
 );
 
 app.post("/mail-homework", jsonParser, (req, res) => {
@@ -208,10 +204,20 @@ app.post("/mail-homework", jsonParser, (req, res) => {
   }
 });
 
-// TTS cache setup
+// ============================================
+// TTS: cache 2 tầng (đĩa cục bộ -> MongoDB) + Google TTS
+// ============================================
+// Tầng 1 (đĩa cục bộ): nhanh nhất vì không qua mạng, nhưng bị xoá sạch mỗi khi
+// host reset filesystem (gói hosting giá rẻ).
+// Tầng 2 (MongoDB): bền vững qua các lần reset đĩa, tốc độ đọc/ghi vẫn rất
+// nhanh (một document nhỏ theo _id, không phải quét/aggregate) nên gần như
+// không ảnh hưởng thời gian phản hồi so với việc phải gọi lại Google TTS.
+// Tầng 3: chưa có ở đâu cả thì mới thật sự gọi Google TTS để tạo mới.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CACHE_DIR = path.resolve(__dirname, "./tts_cache");
+const TTS_MAX_CHUNK_LENGTH = 200; // giới hạn ký tự/lần gọi của google-tts-api
+const TTS_MONGO_COLLECTION = "tts_audio_cache";
 
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR);
@@ -220,60 +226,86 @@ if (!fs.existsSync(CACHE_DIR)) {
 let ttsQueue = [];
 let isProcessing = false;
 
-function getCachePath(text) {
-  const hash = crypto.createHash("md5").update(text).digest("hex");
+function setAudioHeaders(res) {
+  res.set({
+    "Content-Type": "audio/mpeg",
+    "Content-Disposition": 'inline; filename="speech.mp3"',
+  });
+}
+
+function streamAudioFile(res, filePath) {
+  setAudioHeaders(res);
+  fs.createReadStream(filePath).pipe(res);
+}
+
+function sendAudioBuffer(res, buffer) {
+  setAudioHeaders(res);
+  res.send(buffer);
+}
+
+function getCacheHash(text) {
+  return crypto.createHash("md5").update(text).digest("hex");
+}
+
+function getDiskCachePath(hash) {
   return path.join(CACHE_DIR, `${hash}.mp3`);
 }
 
-// async function processQueue() {
-//   if (isProcessing || ttsQueue.length === 0) return;
-//   isProcessing = true;
-//   const { text, res } = ttsQueue.shift();
-//   const cachePath = getCachePath(text);
-//   try {
-//     // Nếu cache tồn tại lúc đang xử lý
-//     if (fs.existsSync(cachePath)) {
-//       fs.createReadStream(cachePath)
-//         .on("open", () => {
-//           res.set({
-//             "Content-Type": "audio/mpeg",
-//             "Content-Disposition": 'inline; filename="speech.mp3"',
-//           });
-//         })
-//         .pipe(res)
-//         .on("finish", () => {
-//           isProcessing = false;
-//           setTimeout(processQueue, 100);
-//         });
-//       return;
-//     }
-//     // Chưa có cache, gọi Google TTS
-//     const url = googleTTS.getAudioUrl(text, {
-//       lang: "en",
-//       slow: true,
-//     });
-//     const audioRes = await fetch(url);
-//     const arrayBuffer = await audioRes.arrayBuffer();
-//     const buffer = Buffer.from(arrayBuffer);
-//     // Lưu file cache
-//     fs.writeFileSync(cachePath, buffer);
-//     res.set({
-//       "Content-Type": "audio/mpeg",
-//       "Content-Disposition": 'inline; filename="speech.mp3"',
-//     });
-//     res.send(buffer);
-//   } catch (err) {
-//     console.error("TTS error:", err);
+function writeDiskCache(hash, buffer) {
+  try {
+    fs.writeFileSync(getDiskCachePath(hash), buffer);
+  } catch (err) {
+    console.error("⚠️ Không thể ghi TTS cache ra đĩa:", err.message);
+  }
+}
 
-//     res.status(500).send("TTS failed");
-//   } finally {
-//     isProcessing = false;
-//     setTimeout(processQueue, 500); // tránh spam
-//   }
-// }
+// BSON Binary -> Buffer (driver có thể trả về Binary thay vì Buffer thuần)
+function toNodeBuffer(value) {
+  if (Buffer.isBuffer(value)) return value;
+  if (value?.buffer) return Buffer.from(value.buffer);
+  return Buffer.from(value);
+}
 
-// Hàm tách text thành các đoạn nhỏ hơn 200 ký tự
-function splitText(text, maxLength = 200) {
+async function readMongoCache(hash) {
+  try {
+    const doc = await getCollection(TTS_MONGO_COLLECTION).findOne(
+      { _id: hash },
+      { projection: { audio: 1 } },
+    );
+    return doc ? toNodeBuffer(doc.audio) : null;
+  } catch (err) {
+    // MongoDB chỉ là cache bền vững phụ — lỗi ở đây không được làm hỏng luồng TTS chính
+    console.warn("⚠️ Không đọc được TTS cache từ MongoDB:", err.message);
+    return null;
+  }
+}
+
+// Fire-and-forget: không await ở nơi gọi để không làm chậm response
+function writeMongoCache(hash, buffer, text) {
+  try {
+    getCollection(TTS_MONGO_COLLECTION)
+      .updateOne(
+        { _id: hash },
+        {
+          $set: {
+            audio: buffer,
+            textLength: text.length,
+            lastAccessedAt: new Date(),
+          },
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true },
+      )
+      .catch((err) => {
+        console.warn("⚠️ Không ghi được TTS cache vào MongoDB:", err.message);
+      });
+  } catch (err) {
+    console.warn("⚠️ Không ghi được TTS cache vào MongoDB:", err.message);
+  }
+}
+
+// Hàm tách text thành các đoạn nhỏ hơn maxLength ký tự (theo câu, rồi theo từ)
+function splitText(text, maxLength = TTS_MAX_CHUNK_LENGTH) {
   if (text.length <= maxLength) return [text];
   const chunks = [];
   let current = "";
@@ -319,7 +351,7 @@ function splitText(text, maxLength = 200) {
   return chunks.length > 0 ? chunks : [text];
 }
 
-// Hàm tạo audio buffer từ text chunk
+// Hàm tạo audio buffer từ một chunk text (1 lần gọi Google TTS)
 async function createAudioBuffer(text) {
   const url = googleTTS.getAudioUrl(text, {
     lang: "en",
@@ -335,91 +367,71 @@ async function mergeAudioBuffers(audioBuffers) {
   if (audioBuffers.length === 1) {
     return audioBuffers[0];
   }
-
   // Nối các buffer lại với nhau đơn giản
   // Lưu ý: Đây là cách nối đơn giản, có thể không hoàn hảo về mặt audio
   return Buffer.concat(audioBuffers);
 }
 
+// Sinh audio mới hoàn toàn qua Google TTS (được gọi khi cả 2 tầng cache đều miss)
+async function generateAudioBuffer(text) {
+  if (text.length <= TTS_MAX_CHUNK_LENGTH) {
+    return createAudioBuffer(text);
+  }
+  const chunks = splitText(text, TTS_MAX_CHUNK_LENGTH);
+  // Gọi song song thay vì tuần tự: văn bản càng dài (càng nhiều chunk) thì
+  // càng lợi thời gian, đúng lúc text > 200 ký tự cần cải thiện tốc độ nhất.
+  // Thứ tự chunks[] vẫn được giữ nguyên khi ghép vì Promise.all trả về mảng
+  // kết quả đúng theo thứ tự input.
+  const audioBuffers = await Promise.all(chunks.map(createAudioBuffer));
+  return mergeAudioBuffers(audioBuffers);
+}
+
+// Xử lý hàng đợi: chỉ những request THỰC SỰ cần gọi Google TTS mới vào đây,
+// cache-hit (đĩa hoặc MongoDB) được trả thẳng ở route, không phải xếp hàng.
 async function processQueue() {
   if (isProcessing || ttsQueue.length === 0) return;
   isProcessing = true;
   const { text, res } = ttsQueue.shift();
-  const cachePath = getCachePath(text);
+  const hash = getCacheHash(text);
 
   try {
-    // Nếu cache tồn tại lúc đang xử lý
-    if (fs.existsSync(cachePath)) {
-      fs.createReadStream(cachePath)
-        .on("open", () => {
-          res.set({
-            "Content-Type": "audio/mpeg",
-            "Content-Disposition": 'inline; filename="speech.mp3"',
-          });
-        })
-        .pipe(res)
-        .on("finish", () => {
-          isProcessing = false;
-          setTimeout(processQueue, 100);
-        });
-      return;
-    }
-
-    let finalBuffer;
-
-    // Kiểm tra độ dài text
-    if (text.length > 200) {
-      // Tách text thành các chunk
-      const textChunks = splitText(text, 200);
-      const audioBuffers = [];
-
-      // Tạo audio buffer cho từng chunk
-      for (let i = 0; i < textChunks.length; i++) {
-        const chunkBuffer = await createAudioBuffer(textChunks[i]);
-        audioBuffers.push(chunkBuffer);
-      }
-
-      // Ghép các buffer lại
-      finalBuffer = await mergeAudioBuffers(audioBuffers);
-    } else {
-      // Text ngắn, xử lý bình thường
-      finalBuffer = await createAudioBuffer(text);
-    }
-
-    // Lưu vào cache
-    fs.writeFileSync(cachePath, finalBuffer);
-
-    // Trả về buffer
-    res.set({
-      "Content-Type": "audio/mpeg",
-      "Content-Disposition": 'inline; filename="speech.mp3"',
-    });
-    res.send(finalBuffer);
+    const buffer = await generateAudioBuffer(text);
+    writeDiskCache(hash, buffer);
+    writeMongoCache(hash, buffer, text);
+    sendAudioBuffer(res, buffer);
   } catch (err) {
     console.error("TTS error:", err);
     res.status(500).send("TTS failed");
   } finally {
     isProcessing = false;
-    setTimeout(processQueue, 500); // tránh spam
+    setTimeout(processQueue, 500); // tránh spam Google TTS
   }
 }
-app.post("/tts", (req, res) => {
+
+app.post("/tts", async (req, res) => {
   const text = req.body.text?.trim();
   if (!text) return res.status(400).send("Missing text");
-  const cachePath = getCachePath(text);
-  // Trả cache nếu có
-  if (fs.existsSync(cachePath)) {
-    return fs
-      .createReadStream(cachePath)
-      .on("open", () => {
-        res.set({
-          "Content-Type": "audio/mpeg",
-          "Content-Disposition": 'inline; filename="speech.mp3"',
-        });
-      })
-      .pipe(res);
+
+  const hash = getCacheHash(text);
+
+  // Tầng 1: cache trên đĩa — trả ngay, không qua hàng đợi
+  const diskPath = getDiskCachePath(hash);
+  if (fs.existsSync(diskPath)) {
+    streamAudioFile(res, diskPath);
+    // Tự "chữa lành" MongoDB nếu record này chưa có (ví dụ tạo trước khi có Mongo)
+    writeMongoCache(hash, fs.readFileSync(diskPath), text);
+    return;
   }
-  // Thêm vào queue xử lý
+
+  // Tầng 2: cache trên MongoDB — trả ngay, không cần gọi lại Google TTS
+  const mongoBuffer = await readMongoCache(hash);
+  if (mongoBuffer) {
+    writeDiskCache(hash, mongoBuffer); // đổ lại đĩa để lần sau nhanh hơn nữa
+    sendAudioBuffer(res, mongoBuffer);
+    return;
+  }
+
+  // Tầng 3: chưa có cache ở đâu — xếp hàng để tạo mới qua Google TTS
   ttsQueue.push({ text, res });
   processQueue();
 });
@@ -459,7 +471,8 @@ app.use("/", ttsList(jsonParser, Ffmpeg)); // ✅ ĐÚNG
 app.use("/", ttsListTV(jsonParser)); // ✅ ĐÚNG
 app.use("/", mp3Cut(jsonParser, Ffmpeg)); // ✅ ĐÚNG
 
-// Start the server
+// Start the server (chỉ 1 nơi duy nhất gọi listen)
+// Luôn listen trước, không đợi Mongo connect thành công
 server.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`);
   console.log(`Available routes:`);
@@ -468,3 +481,15 @@ server.listen(port, () => {
   console.log(`- GET /test - Test endpoint (GET)`);
   console.log(`- POST /test - Test endpoint (POST)`);
 });
+
+// Kết nối Mongo song song, không chặn server, không crash nếu lỗi
+connectMongo()
+  .then(() => {
+    console.log("✅ MongoDB connected");
+  })
+  .catch((err) => {
+    console.error(
+      "⚠️ Không thể kết nối MongoDB (server vẫn chạy, sẽ dùng chế độ offline/thiếu DB):",
+      err.message,
+    );
+  });
