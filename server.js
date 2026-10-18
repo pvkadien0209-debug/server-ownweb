@@ -14,6 +14,10 @@ import { fileURLToPath } from "url";
 // Import local modules
 import routerIO from "./router/io.js";
 import message from "./router/message.js";
+// Dọn dẹp — đã bỏ hết các socket handler riêng cho RoomofflineV6 (ArenaV6)
+// và Garden/City/Career/Memory/Monopoly V1 (routerIOArenaV6,
+// routerIOGardenV1, routerIOCityV1, routerIOCareerV1, routerIOMemoryV1,
+// routerIOMonopolyV1) theo yêu cầu, không dùng nữa.
 import { RegAnalyze } from "./ulti/reg_analyze.js";
 import { RegAnalyzeInPrac } from "./ulti/reg_analyze_inprac.js";
 import { GetDataPracInCustom } from "./ulti/get_data_prac_in_custom.js";
